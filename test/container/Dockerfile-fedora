@@ -79,6 +79,7 @@ RUN dnf -y install --setopt=install_weak_deps=False \
     make \
     mdadm \
     memstrack \
+    mtools \
     ndctl \
     NetworkManager \
     nfs-utils \
