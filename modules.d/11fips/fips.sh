@@ -14,20 +14,81 @@ else
     }
 fi
 
+FIPS_LOADER_EFIVARS=/sys/firmware/efi/efivars
+FIPS_LOADER_GUID=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+
+# Prints the string value of the systemd boot loader/stub EFI variable $1.
+# The efivar file has a 4 bytes header and contains UCS-2 data. Note, 'cat' is
+# required as /sys/firmware/efi/efivars/ files are 'special' and don't allow
+# 'seeking'.
+read_loader_efivar() {
+    local _var="$FIPS_LOADER_EFIVARS/$1-$FIPS_LOADER_GUID"
+
+    [ -f "$_var" ] || return 1
+    # shellcheck disable=SC2002
+    cat "$_var" | tail -c +5 | tr -d '\0'
+}
+
 # Checks if a systemd-based UKI is running and ESP UUID is set
 is_uki() {
-    [ -f /sys/firmware/efi/efivars/StubFeatures-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ] \
-        && [ -f /sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ]
+    [ -f "$FIPS_LOADER_EFIVARS/StubFeatures-$FIPS_LOADER_GUID" ] \
+        && [ -f "$FIPS_LOADER_EFIVARS/LoaderDevicePartUUID-$FIPS_LOADER_GUID" ]
+}
+
+# Checks if systemd-stub (v257+) reported where the UKI was loaded from
+has_stub_location() {
+    [ -f "$FIPS_LOADER_EFIVARS/StubDevicePartUUID-$FIPS_LOADER_GUID" ] \
+        && [ -f "$FIPS_LOADER_EFIVARS/StubImageIdentifier-$FIPS_LOADER_GUID" ]
+}
+
+# Prints the partition UUID of the partition the UKI was loaded from
+stub_part_uuid() {
+    read_loader_efivar StubDevicePartUUID | tr 'A-F' 'a-f'
+}
+
+# Prints the path of the booted UKI relative to the root of the partition it
+# was loaded from, as reported by systemd-stub in StubImageIdentifier. Fails
+# if that is missing or is not a usable path.
+booted_uki_path() {
+    local _id _path
+
+    _id=$(read_loader_efivar StubImageIdentifier) || return 1
+
+    # The identifier is an EFI device path in text form. Usually it is only
+    # the file path, e.g. '\EFI\Linux\foo.efi', but drop any device nodes
+    # in front of it, and turn the file path into a POSIX one.
+    case "$_id" in
+        *\\*) _path="\\${_id#*\\}" ;;
+        *)
+            warn "Cannot find a file path in StubImageIdentifier '$_id'"
+            return 1
+            ;;
+    esac
+    _path=$(printf '%s\n' "$_path" | tr -s '\134' /)
+
+    case "/$_path/" in
+        */../*)
+            warn "Refusing StubImageIdentifier '$_id' with a '..' component"
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$_path"
 }
 
 mount_boot() {
+    local _boot_arg _stub_dev
+
     boot=$(getarg boot=)
+    _boot_arg=$boot
 
     if is_uki && [ -z "$boot" ]; then
-        # efivar file has 4 bytes header and contain UCS-2 data. Note, 'cat' is required
-        # as sys/firmware/efi/efivars/ files are 'special' and don't allow 'seeking'.
-        # shellcheck disable=SC2002
-        boot="PARTUUID=$(cat /sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f | tail -c +5 | tr -d '\0' | tr 'A-F' 'a-f')"
+        # Prefer the partition the UKI was loaded from, which is not the ESP
+        # when the UKI is on an XBOOTLDR partition.
+        if has_stub_location; then
+            boot="PARTUUID=$(stub_part_uuid)"
+        else
+            boot="PARTUUID=$(read_loader_efivar LoaderDevicePartUUID | tr 'A-F' 'a-f')"
+        fi
     fi
 
     if [ -n "$boot" ]; then
@@ -66,6 +127,17 @@ mount_boot() {
 
         [ -e "$boot" ] || return 1
 
+        # The UKI check looks for the booted UKI on /boot, so an explicit
+        # boot= must be the partition it was loaded from.
+        if [ -n "$_boot_arg" ] && is_uki && has_stub_location; then
+            _stub_dev="/dev/disk/by-partuuid/$(stub_part_uuid)"
+            [ -e "$_stub_dev" ] || udevadm settle --timeout=20 --exit-if-exists="$_stub_dev"
+            if [ "$(readlink -f "$boot")" != "$(readlink -f "$_stub_dev")" ]; then
+                warn "'boot=$_boot_arg' is not the partition the UKI was booted from ($_stub_dev)"
+                return 1
+            fi
+        fi
+
         mkdir -p /boot
         fips_info "Mounting $boot as /boot"
         mount -oro "$boot" /boot || return 1
@@ -94,31 +166,60 @@ do_rhevh_check() {
     return 0
 }
 
+# Checks the UKI at path $1 against the .<name>.hmac file next to it. The
+# HMAC is computed over $1 itself, whatever file name the .hmac lists.
+check_uki_hmac() {
+    local _hmac="${1%/*}/.${1##*/}.hmac"
+    local _expected=
+    local _actual
+
+    fips_info "checking $_hmac"
+    if ! [ -r "$_hmac" ]; then
+        warn "$_hmac does not exist"
+        return 1
+    fi
+    read -r _expected _ < "$_hmac" || [ -n "$_expected" ]
+    _actual=$(sha512hmac "$1") || return 1
+    _actual=${_actual%% *}
+    if [ -z "$_expected" ] || [ "$_expected" != "$_actual" ]; then
+        warn "HMAC sum mismatch for $1"
+        return 1
+    fi
+    fips_info "$1: OK"
+}
+
 do_uki_check() {
     local KVER
     local uki_checked=0
+    local UKIpath
 
     KVER="$(uname -r)"
-    # UKI are placed in $ESP\EFI\Linux\<intall-tag>-<uname-r>.efi
     if ! [ "$FIPS_MOUNTED_BOOT" = 1 ]; then
         warn "Failed to mount ESP for doing UKI integrity check"
         return 1
     fi
 
+    # Check exactly the UKI that was booted, wherever it is on the partition.
+    if has_stub_location; then
+        UKIpath="/boot$(booted_uki_path)" || return 1
+        if ! [ -f "$UKIpath" ]; then
+            warn "Booted UKI '$UKIpath' not found for checking"
+            return 1
+        fi
+        check_uki_hmac "$UKIpath"
+        return
+    fi
+
     for UKIpath in /boot/EFI/Linux/*-"$KVER".efi; do
         # UKIs are installed to $ESP/EFI/Linux/<entry-token-or-machine-id>-<uname-r>.efi
         # and in some cases (e.g. when the image is used as a template for creating new
-        # VMs) entry-token-or-machine-id can change. To make sure the running UKI is
-        # always checked, check all UKIs which match the 'uname -r' of the running kernel
+        # VMs) entry-token-or-machine-id can change. Without systemd-stub telling which
+        # UKI was booted, check all UKIs which match the 'uname -r' of the running kernel
         # and fail the whole check if any of the matching UKIs are corrupted.
 
         [ -r "$UKIpath" ] || break
 
-        local UKI="${UKIpath##*/}"
-        local UKIHMAC=."$UKI".hmac
-
-        fips_info "checking $UKIHMAC"
-        (cd /boot/EFI/Linux/ && sha512hmac -c "$UKIHMAC") || return 1
+        check_uki_hmac "$UKIpath" || return 1
         uki_checked=1
     done
 
